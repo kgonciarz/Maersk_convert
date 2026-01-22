@@ -6,28 +6,46 @@ st.set_page_config(page_title="Maersk → AAA Formatter", layout="wide")
 
 
 # ---------- Helpers ----------
-def detect_header_row(file_bytes: bytes, sheet_name: str, max_scan_rows: int = 60) -> int:
+def detect_header_row(file_bytes: bytes, sheet_name: str, max_scan_rows: int = 80) -> int:
     """
-    Detect the actual header row by scanning for required column names.
+    Detect the main header row (the row that contains: Load Port, To..., Charge Code).
+    We'll then read with a TWO-row header: [header_row-1, header_row]
+    because Maersk puts container types (20DRY/40DRY/40HDRY) one row above.
     """
     preview = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=max_scan_rows)
-    required = {"Load Port", "To (City, Country/Region)", "Charge Code"}
 
+    required = {"Load Port", "To (City, Country/Region)", "Charge Code"}
     for r in range(len(preview)):
         values = set(str(x).strip() for x in preview.iloc[r].tolist() if pd.notna(x))
         if required.issubset(values):
             return r
 
-    # Fallback if "To (City, Country/Region)" slightly differs
+    # fallback if To column differs slightly
     for r in range(len(preview)):
         values = [str(x).strip() for x in preview.iloc[r].tolist() if pd.notna(x)]
         if "Load Port" in values and "Charge Code" in values:
             return r
 
-    raise ValueError(
-        f"Could not detect the header row in sheet '{sheet_name}'. "
-        "The file layout may be different than expected."
-    )
+    raise ValueError(f"Could not detect the header row in sheet '{sheet_name}'.")
+
+
+def flatten_two_row_header(cols: pd.MultiIndex) -> list[str]:
+    """
+    Turn MultiIndex columns like:
+      ('20DRY', 'Rate') -> '20DRY_Rate'
+      ('Unnamed: 1_level_0', 'Load Port') -> 'Load Port'
+    Also handles Maersk quirks where 'Rfq Ids'/'Comments' appear under a container group.
+    """
+    flat = []
+    for top, bottom in cols:
+        top = "" if pd.isna(top) else str(top)
+        bottom = "" if pd.isna(bottom) else str(bottom)
+
+        if top.startswith("Unnamed") or bottom in ("Rfq Ids", "Comments"):
+            flat.append(bottom)
+        else:
+            flat.append(f"{top}_{bottom}")
+    return flat
 
 
 def to_number(x):
@@ -55,52 +73,81 @@ def is_ams_or_batam(to_value: str) -> bool:
 
 def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.DataFrame:
     """
-    Returns a DataFrame with AAA-ready columns:
-    POL, POD, CONTAINER, FREIGHT, Currency, Surcharge, TT, Additional Charge
+    Output columns for AAA:
+      POL, POD, CONTAINER, FREIGHT, Currency, Surcharge, TT, Additional Charge
+
+    Rules:
+      - FREIGHT = sum of ALL Charge Type == 'FREIGHT' (per container) + IHI if AMS/Batam
+      - Surcharge = FFF
+      - Additional Charge = DTI
+      - 20 from 20DRY
+      - 40 from 40DRY (fallback 40HDRY)
     """
 
     header_row = detect_header_row(file_bytes, sheet_name=sheet_name)
-    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=header_row)
+    if header_row == 0:
+        raise ValueError("Header row detected at 0 — file format unexpected (needs 2-row header).")
 
-    base_cols = ["Load Port", "To (City, Country/Region)", "Transit Time", "Charge Code", "Charge Name"]
-    for c in base_cols:
+    # Read with 2-row header: container row + field row
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=[header_row - 1, header_row])
+    if not isinstance(df.columns, pd.MultiIndex):
+        raise ValueError("Expected a 2-row header (MultiIndex columns) but did not get one.")
+
+    df.columns = flatten_two_row_header(df.columns)
+
+    required_cols = [
+        "Load Port",
+        "To (City, Country/Region)",
+        "Transit Time",
+        "Charge Type",
+        "Charge Code",
+        "Charge Name",
+        "Rate Basis",
+    ]
+    for c in required_cols:
         if c not in df.columns:
             raise ValueError(f"Missing required column: {c}")
 
-    rate_cols = [c for c in df.columns if str(c).startswith("Rate")]
-    cur_cols = [c for c in df.columns if str(c).startswith("Currency")]
+    # Container rate/currency sources (prefer DRY, fallback to HDRY for 40)
+    container_sources = {
+        20: [("20DRY_Rate", "20DRY_Currency")],
+        40: [("40DRY_Rate", "40DRY_Currency"), ("40HDRY_Rate", "40HDRY_Currency")],
+    }
 
-    if not rate_cols or not cur_cols:
-        raise ValueError("Rate / Currency columns not found in the Maersk file.")
-
-    def suffix(name: str) -> str:
-        return str(name).replace("Rate", "").replace("Currency", "")
-
-    rate_by = {suffix(c): c for c in rate_cols}
-    cur_by = {suffix(c): c for c in cur_cols}
-    suffixes = sorted(
-        [s for s in rate_by.keys() if s in cur_by.keys()],
-        key=lambda s: (len(s), s)
-    )
-
-    # First rate column = 20, remaining = 40
-    container_map = {}
-    for i, s in enumerate(suffixes[:3]):
-        container_map[s] = 20 if i == 0 else 40
-
-    wanted_codes = {"BAS", "FFF", "DTI", "IHI"}
-    df = df[df["Charge Code"].isin(wanted_codes)].copy()
+    # Build long format rows: one row per (lane, charge, container)
+    base_cols = [
+        "Load Port",
+        "To (City, Country/Region)",
+        "Transit Time",
+        "Charge Type",
+        "Charge Code",
+        "Charge Name",
+        "Rate Basis",
+    ]
 
     long_parts = []
-    for sfx, cont in container_map.items():
-        rcol = rate_by[sfx]
-        ccol = cur_by[sfx]
+    for cont, sources in container_sources.items():
+        # pick FIRST non-null rate among sources (for 40: DRY then HDRY)
+        rate_series = None
+        cur_series = None
+        for rcol, ccol in sources:
+            if rcol in df.columns and ccol in df.columns:
+                r = df[rcol].map(to_number)
+                c = df[ccol]
+                if rate_series is None:
+                    rate_series, cur_series = r, c
+                else:
+                    rate_series = rate_series.fillna(r)
+                    cur_series = cur_series.fillna(c)
 
-        part = df[base_cols + [rcol, ccol]].copy()
-        part.rename(columns={rcol: "Charge Rate", ccol: "Charge Currency"}, inplace=True)
+        if rate_series is None:
+            continue
+
+        part = df[base_cols].copy()
         part["CONTAINER"] = cont
-        part["Charge Rate"] = part["Charge Rate"].map(to_number)
-        part = part[part["Charge Rate"].notna()]
+        part["Charge Rate"] = rate_series
+        part["Charge Currency"] = cur_series
+        part = part[part["Charge Rate"].notna()].copy()
         long_parts.append(part)
 
     if not long_parts:
@@ -108,40 +155,65 @@ def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.Dat
 
     long_df = pd.concat(long_parts, ignore_index=True)
 
+    # Keep only per-container charges (avoid per document etc.)
+    long_df = long_df[long_df["Rate Basis"].astype(str).str.upper().eq("PER_CONTAINER")].copy()
+
     idx = ["Load Port", "To (City, Country/Region)", "Transit Time", "CONTAINER"]
 
-    pivot_rate = (
-        long_df.pivot_table(index=idx, columns="Charge Code", values="Charge Rate", aggfunc="first")
-        .reset_index()
+    # Currency pick: prefer BAS currency, else first available
+    def pick_currency(group: pd.DataFrame):
+        bas_cur = group.loc[group["Charge Code"].eq("BAS"), "Charge Currency"]
+        if len(bas_cur) and pd.notna(bas_cur.iloc[0]):
+            return bas_cur.iloc[0]
+        first = group["Charge Currency"].dropna()
+        return first.iloc[0] if len(first) else pd.NA
+
+    # Freight sum: ALL Charge Type == FREIGHT (this includes BAS + surcharges like FFF, etc.)
+    freight_sum = (
+        long_df[long_df["Charge Type"].astype(str).str.upper().eq("FREIGHT")]
+        .groupby(idx, as_index=False)["Charge Rate"]
+        .sum()
+        .rename(columns={"Charge Rate": "FREIGHT_BASE"})
     )
-    pivot_cur = (
-        long_df.pivot_table(index=idx, columns="Charge Code", values="Charge Currency", aggfunc="first")
-        .reset_index()
-    )
 
-    out = pivot_rate.merge(pivot_cur, on=idx, suffixes=("", "_cur"))
+    # Extract specific codes we need
+    def code_value(code: str):
+        return (
+            long_df[long_df["Charge Code"].eq(code)]
+            .groupby(idx, as_index=False)["Charge Rate"]
+            .first()
+            .rename(columns={"Charge Rate": code})
+        )
 
-    def pick_currency(row):
-        if pd.notna(row.get("BAS_cur", pd.NA)):
-            return row["BAS_cur"]
-        for c in ["FFF_cur", "DTI_cur", "IHI_cur"]:
-            if pd.notna(row.get(c, pd.NA)):
-                return row[c]
-        return pd.NA
+    bas = code_value("BAS")
+    fff = code_value("FFF")
+    dti = code_value("DTI")
+    ihi = code_value("IHI")  # inland haulage import (DESTINATION)
 
-    out["Currency"] = out.apply(pick_currency, axis=1)
+    # Build a lane/container base set from long_df (unique lanes + TT + container)
+    lanes = long_df[idx].drop_duplicates().copy()
 
-    if "IHI" not in out.columns:
-        out["IHI"] = 0
+    # Merge everything
+    out = lanes.merge(freight_sum, on=idx, how="left")
+    out = out.merge(bas, on=idx, how="left")
+    out = out.merge(fff, on=idx, how="left")
+    out = out.merge(dti, on=idx, how="left")
+    out = out.merge(ihi, on=idx, how="left")
+
+    # Add currency
+    currency = long_df.groupby(idx).apply(pick_currency).reset_index(name="Currency")
+    out = out.merge(currency, on=idx, how="left")
+
+    # Add inland haulage import ONLY for Amsterdam/Batam
+    out["IHI"] = out["IHI"].fillna(0)
 
     def calc_freight(row):
-        bas = row.get("BAS", pd.NA)
-        if pd.isna(bas):
+        base = row["FREIGHT_BASE"]
+        if pd.isna(base):
             return pd.NA
-        inland = row.get("IHI", 0)
-        if pd.isna(inland):
-            inland = 0
-        return bas + inland if is_ams_or_batam(row["To (City, Country/Region)"]) else bas
+        if is_ams_or_batam(row["To (City, Country/Region)"]):
+            return base + (row["IHI"] if pd.notna(row["IHI"]) else 0)
+        return base
 
     out["FREIGHT"] = out.apply(calc_freight, axis=1)
 
@@ -151,9 +223,9 @@ def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.Dat
         "CONTAINER": out["CONTAINER"],
         "FREIGHT": out["FREIGHT"],
         "Currency": out["Currency"],
-        "Surcharge": out.get("FFF", pd.NA),
+        "Surcharge": out["FFF"],                 # Fossil Fuel Fee
         "TT": out["Transit Time"],
-        "Additional Charge": out.get("DTI", pd.NA),
+        "Additional Charge": out["DTI"],         # Free Time Extension (Contracts)
     }).sort_values(["POL", "POD", "CONTAINER"], ignore_index=True)
 
     return final
@@ -164,10 +236,8 @@ st.title("Maersk Quote → AAA Freight Format")
 
 st.write(
     """
-**How it works**
-1. Upload the Maersk Excel file (QuoteOutput).
-2. The app converts it to AAA format.
-3. Copy & paste the table into AAA, or download the Excel output.
+Upload the Maersk Excel quote (QuoteOutput).
+The app will output AAA-ready rows for 20 and 40.
 """
 )
 
@@ -179,10 +249,7 @@ if uploaded:
         final_df = process_maersk(uploaded.getvalue(), sheet_name=sheet_name)
 
         if final_df.empty:
-            st.warning(
-                "No data was generated. This usually means the required charge codes "
-                "(BAS, FFF, DTI, IHI) were not found or rate columns are empty."
-            )
+            st.warning("No rows generated. Check that the file contains rates for 20DRY/40DRY and per-container charges.")
         else:
             st.subheader("AAA-ready output")
             st.dataframe(final_df, use_container_width=True)
@@ -198,7 +265,7 @@ if uploaded:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            st.info("You can also select the table and copy-paste it directly into your AAA file.")
+            st.info("You can also copy-paste directly from the table into your AAA file.")
     except Exception as e:
         st.error(f"Error: {e}")
 else:
