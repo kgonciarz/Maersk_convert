@@ -7,12 +7,6 @@ st.set_page_config(page_title="Maersk → AAA Formatter", layout="wide")
 
 # ---------- Helpers ----------
 def detect_header_row(file_bytes: bytes, sheet_name: str, max_scan_rows: int = 80) -> int:
-    """
-    Detect the row that contains the real field headers, e.g.
-    Load Port | To (City, Country/Region) | Charge Code | ...
-    Maersk often has a 2-row header where container types (20DRY/40DRY/40HDRY)
-    are on the row ABOVE the field header row.
-    """
     preview = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=max_scan_rows)
     required = {"Load Port", "To (City, Country/Region)", "Charge Code"}
 
@@ -21,7 +15,6 @@ def detect_header_row(file_bytes: bytes, sheet_name: str, max_scan_rows: int = 8
         if required.issubset(values):
             return r
 
-    # fallback if To column differs slightly
     for r in range(len(preview)):
         values = [str(x).strip() for x in preview.iloc[r].tolist() if pd.notna(x)]
         if "Load Port" in values and "Charge Code" in values:
@@ -31,10 +24,6 @@ def detect_header_row(file_bytes: bytes, sheet_name: str, max_scan_rows: int = 8
 
 
 def flatten_two_row_header(cols: pd.MultiIndex) -> list[str]:
-    """
-    MultiIndex columns like ('20DRY','Rate') become '20DRY_Rate'
-    Columns like ('Unnamed: ...', 'Load Port') become 'Load Port'
-    """
     flat = []
     for top, bottom in cols:
         top = "" if pd.isna(top) else str(top).strip()
@@ -60,14 +49,9 @@ def to_number(x):
 
 
 def city_only(x: str) -> str:
-    """
-    "Amsterdam, Netherlands" -> "Amsterdam"
-    Removes spaces for ID-building: "New York" -> "NewYork"
-    """
     if not isinstance(x, str) or not x.strip():
         return ""
-    city = x.split(",")[0].strip()
-    return city.replace(" ", "")
+    return x.split(",")[0].strip().replace(" ", "")
 
 
 def is_ams_or_batam(to_value: str) -> bool:
@@ -75,11 +59,6 @@ def is_ams_or_batam(to_value: str) -> bool:
 
 
 def country_from_pol(pol: str) -> str:
-    """
-    Best-effort:
-      "Lome, TOG" -> "TOG"
-      "Lome" -> ""
-    """
     if not isinstance(pol, str):
         return ""
     parts = [p.strip() for p in pol.split(",")]
@@ -94,31 +73,17 @@ def pick_first_existing(df: pd.DataFrame, candidates: list[str]):
 
 
 def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.DataFrame:
-    """
-    Creates AAA-shaped output with these columns:
-    Shipping Line, ID, country, POL, POD, CONTAINER, FREIGHT, LINER, Currency,
-    Surcharge, ALL_IN, TT, Valid, LinerIncluded, ... , Additional charge (per container) included in all-in
-
-    Rules:
-      - FREIGHT = BAS (+ IHI only if destination is Amsterdam or Batam)
-      - Surcharge = FFF
-      - Additional charge included in all-in = DTI (Free Time Extension)
-      - ALL_IN = sum of ALL PER_CONTAINER charges (+ IHI only for AMS/Batam),
-                but to avoid double count we exclude IHI from the sum then add it conditionally.
-    """
-
     header_row = detect_header_row(file_bytes, sheet_name=sheet_name)
     if header_row == 0:
         raise ValueError("Header row detected at row 0; expected a 2-row header layout.")
 
-    # Read with 2-row header
+    # Read with 2-row header (container row + field row)
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=[header_row - 1, header_row])
     if not isinstance(df.columns, pd.MultiIndex):
         raise ValueError("Expected a 2-row header (MultiIndex columns), but did not get one.")
 
     df.columns = flatten_two_row_header(df.columns)
 
-    # Required fields
     required = [
         "Load Port",
         "To (City, Country/Region)",
@@ -131,11 +96,7 @@ def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.Dat
         if c not in df.columns:
             raise ValueError(f"Missing required column: {c}")
 
-    # Charge Type is sometimes available; if not, we can still compute ALL_IN by summing all PER_CONTAINER
-    has_charge_type = "Charge Type" in df.columns
-
-    # Rate/currency columns for containers
-    # Prefer 40DRY, fallback 40HDRY for 40'
+    # Rate/currency columns (prefer 40DRY, fallback 40HDRY)
     container_sources = {
         20: [("20DRY_Rate", "20DRY_Currency")],
         40: [("40DRY_Rate", "40DRY_Currency"), ("40HDRY_Rate", "40HDRY_Currency")],
@@ -149,8 +110,6 @@ def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.Dat
         "Charge Name",
         "Rate Basis",
     ]
-    if has_charge_type:
-        base_cols.insert(3, "Charge Type")  # keep it with the charge fields
 
     long_parts = []
     for cont, sources in container_sources.items():
@@ -207,23 +166,14 @@ def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.Dat
             .rename(columns={"Charge Rate": code})
         )
 
-    bas = code_value("BAS")   # base ocean freight
-    fff = code_value("FFF")   # surcharge (fuel, etc.)
-    dti = code_value("DTI")   # free time extension
-    ihi = code_value("IHI")   # inland haulage import (to be added to freight for AMS/Batam)
+    bas = code_value("BAS")
+    fff = code_value("FFF")
+    dti = code_value("DTI")
+    ihi = code_value("IHI")
 
     lanes = long_df[idx].drop_duplicates().copy()
 
-    # ALL_IN base: sum of all per-container charges EXCEPT IHI (we'll add it conditionally)
-    allin_sum = (
-        long_df[~long_df["Charge Code"].eq("IHI")]
-        .groupby(idx, as_index=False)["Charge Rate"]
-        .sum()
-        .rename(columns={"Charge Rate": "ALL_IN_BASE"})
-    )
-
-    out = lanes.merge(allin_sum, on=idx, how="left")
-    out = out.merge(currency, on=idx, how="left")
+    out = lanes.merge(currency, on=idx, how="left")
     out = out.merge(bas, on=idx, how="left")
     out = out.merge(fff, on=idx, how="left")
     out = out.merge(dti, on=idx, how="left")
@@ -231,6 +181,7 @@ def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.Dat
 
     out["IHI"] = out["IHI"].fillna(0)
 
+    # FREIGHT = BAS (+ IHI only for AMS/Batam)
     def calc_freight(row):
         bas_val = row.get("BAS", pd.NA)
         if pd.isna(bas_val):
@@ -239,15 +190,18 @@ def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.Dat
             return bas_val + row["IHI"]
         return bas_val
 
-    def calc_all_in(row):
-        base = row.get("ALL_IN_BASE", pd.NA)
-        if pd.isna(base):
-            return pd.NA
-        if is_ams_or_batam(row["To (City, Country/Region)"]):
-            return base + row["IHI"]
-        return base
-
     out["FREIGHT"] = out.apply(calc_freight, axis=1)
+
+    # ALL_IN = FREIGHT + Surcharge (FFF)
+    def calc_all_in(row):
+        freight = row.get("FREIGHT", pd.NA)
+        surcharge = row.get("FFF", 0)
+        if pd.isna(freight):
+            return pd.NA
+        if pd.isna(surcharge):
+            surcharge = 0
+        return freight + surcharge
+
     out["ALL_IN"] = out.apply(calc_all_in, axis=1)
 
     # Shipping Line ID like "LomeAmsterdam40"
@@ -255,19 +209,12 @@ def process_maersk(file_bytes: bytes, sheet_name: str = "QuoteOutput") -> pd.Dat
     out["POD_city"] = out["To (City, Country/Region)"].map(city_only)
     out["ID"] = out["POL_city"] + out["POD_city"] + out["CONTAINER"].astype(str)
 
-    # country (best effort)
     out["country"] = out["Load Port"].map(country_from_pol)
 
     # Valid date: try common Maersk columns if they exist; else blank
     valid_col = pick_first_existing(df, ["Valid To", "Valid Until", "Expiry Date", "Expiration Date", "Quote Expiry"])
-    if valid_col:
-        # If valid_col came from multiheader flattening, it might be like "Something_Valid To"
-        # We try to pull it directly from df
-        valid_series = df[valid_col]
-    else:
-        valid_series = ""
+    valid_series = df[valid_col] if valid_col else ""
 
-    # AAA-shaped output (keep headers exactly as you typed, including spaces if you need them)
     final = pd.DataFrame({
         "Shipping Line": "MAERSK",
         "ID": out["ID"],
@@ -302,7 +249,9 @@ st.title("Maersk Quote → AAA Freight Format (COCOA)")
 st.write(
     """
 Upload the Maersk Excel quote (usually sheet **QuoteOutput**).
-The app outputs an AAA-ready table (with Shipping Line defaults + computed FREIGHT/ALL_IN).
+Output matches your AAA columns, with:
+- FREIGHT = BAS (+ IHI only for Amsterdam/Batam)
+- ALL_IN = FREIGHT + FFF
 """
 )
 
