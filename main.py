@@ -52,8 +52,14 @@ def norm_cur(x) -> str:
     if pd.isna(x):
         return ""
     s = str(x).strip().upper()
-    return "" if s in {"NA", "N/A", "NONE"} else s
-
+    s = s.replace(".", "")
+    mapping = {
+        "US$": "USD",
+        "USDOLLAR": "USD",
+        "EURO": "EUR",
+        "€": "EUR",
+    }
+    return mapping.get(s, s)
 
 def city_only(x: str) -> str:
     if not isinstance(x, str) or not x.strip():
@@ -119,23 +125,39 @@ def get_fx_rate_yfinance(from_cur: str, to_cur: str, fx_date: date) -> float:
     if from_cur == to_cur:
         return 1.0
     if not YF_AVAILABLE:
-        raise RuntimeError("yfinance not available. Install it or use manual FX rates.")
+        raise RuntimeError("yfinance not available")
 
     start = pd.Timestamp(fx_date).date()
-    end = (pd.Timestamp(fx_date) + pd.Timedelta(days=5)).date()
+    end = (pd.Timestamp(fx_date) + pd.Timedelta(days=7)).date()
 
-    direct = _yf_close_on_or_after(fx_ticker(from_cur, to_cur), start, end)
-    if direct is not None:
+    # 1) direct: 1 FROM in TO
+    direct_ticker = f"{from_cur}{to_cur}=X"
+    direct = _yf_close_on_or_after(direct_ticker, start, end)
+    if direct is not None and direct > 0:
         return float(direct)
 
-    # try USD pivot
+    # 2) inverse available? use 1 / (1 TO in FROM)
+    inv_ticker = f"{to_cur}{from_cur}=X"
+    inv = _yf_close_on_or_after(inv_ticker, start, end)
+    if inv is not None and inv > 0:
+        return 1.0 / float(inv)
+
+    # 3) USD pivot (with inverse safety)
     if from_cur != "USD" and to_cur != "USD":
-        r1 = _yf_close_on_or_after(fx_ticker(from_cur, "USD"), start, end)
-        r2 = _yf_close_on_or_after(fx_ticker("USD", to_cur), start, end)
+        r1 = _yf_close_on_or_after(f"{from_cur}USD=X", start, end)
+        if r1 is None:
+            inv1 = _yf_close_on_or_after(f"USD{from_cur}=X", start, end)
+            r1 = (1.0 / inv1) if inv1 else None
+
+        r2 = _yf_close_on_or_after(f"USD{to_cur}=X", start, end)
+        if r2 is None:
+            inv2 = _yf_close_on_or_after(f"{to_cur}USD=X", start, end)
+            r2 = (1.0 / inv2) if inv2 else None
+
         if r1 is not None and r2 is not None:
             return float(r1) * float(r2)
 
-    raise RuntimeError(f"Could not fetch FX rate for {from_cur}->{to_cur} near {fx_date}.")
+    raise RuntimeError(f"Could not fetch FX rate for {from_cur}->{to_cur}")
 
 
 def get_fx_rate(from_cur: str, to_cur: str, fx_date: date, manual_rates: dict[tuple[str, str], float]) -> float:
