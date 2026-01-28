@@ -344,7 +344,13 @@ def process_maersk(
         )
         .reset_index()
     )
+
+    # ✅ Rename pivoted code columns to avoid collisions with real columns like "DTI"
+    rename_map = {c: f"{c}_audit" for c in audit_wide.columns if c not in idx}
+    audit_wide = audit_wide.rename(columns=rename_map)
+
     out = out.merge(audit_wide, on=idx, how="left")
+
 
     # IDs / country
     out["POL_city"] = out["Load Port"].map(city_only)
@@ -377,8 +383,10 @@ def process_maersk(
 
     # Add audit columns for each surcharge code if present
     for code in sorted(SURCHARGE_CODES):
-        if code in out.columns:
-            final_cols[f"{code} (audit)"] = out[code]
+        col = f"{code}_audit"
+        if col in out.columns:
+            final_cols[f"{code} (audit)"] = out[col]
+
 
     final = pd.DataFrame(final_cols).sort_values(["POL", "POD", "CONTAINER"], ignore_index=True)
     return final
