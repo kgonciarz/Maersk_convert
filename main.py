@@ -422,8 +422,20 @@ def process_maersk(
             final_cols[f"{code} (audit)"] = out[col]
 
 
-    final = pd.DataFrame(final_cols).sort_values(["POL", "POD", "CONTAINER"], ignore_index=True)
+    final = pd.DataFrame(final_cols)
+
+    final = (
+        final
+        .sort_values(["POL", "POD", "CONTAINER"])
+        .drop_duplicates(
+            subset=["POL", "POD", "CONTAINER"],
+            keep="first"
+        )
+        .reset_index(drop=True)
+    )
+
     return final
+
 
 
 # ---------- UI ----------
