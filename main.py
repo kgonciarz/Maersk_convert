@@ -61,7 +61,7 @@ def norm_cur(x) -> str:
     }
     return mapping.get(s, s)
 
-def city_key(x: str) -> str:
+def city_only(x: str) -> str:
     """Normalize city name for matching (Batam Island -> batam)."""
     if not isinstance(x, str) or not x.strip():
         return ""
@@ -80,7 +80,7 @@ def city_key(x: str) -> str:
     return first  # fallback
 
 def is_ams_or_batam(to_value: str) -> bool:
-    return city_key(to_value) in {"amsterdam", "batam"}
+    return city_only(to_value) in {"amsterdam", "batam"}
 
 
 def country_from_pol(pol: str) -> str:
