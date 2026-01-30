@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 from io import BytesIO
 from datetime import date, datetime
-
+import re
 st.set_page_config(page_title="Maersk → AAA COCOA Formatter", layout="wide")
 
 # Optional FX
@@ -61,14 +61,26 @@ def norm_cur(x) -> str:
     }
     return mapping.get(s, s)
 
-def city_only(x: str) -> str:
+def city_key(x: str) -> str:
+    """Normalize city name for matching (Batam Island -> batam)."""
     if not isinstance(x, str) or not x.strip():
         return ""
-    return x.split(",")[0].strip().replace(" ", "")
+    first = x.split(",")[0].strip().lower()
 
+    # keep only letters/spaces
+    first = re.sub(r"[^a-z\s]", " ", first)
+    first = re.sub(r"\s+", " ", first).strip()
+
+    # handle common variants
+    if first.startswith("batam"):
+        return "batam"
+    if first.startswith("amsterdam"):
+        return "amsterdam"
+
+    return first  # fallback
 
 def is_ams_or_batam(to_value: str) -> bool:
-    return city_only(to_value).lower() in {"amsterdam", "batam"}
+    return city_key(to_value) in {"amsterdam", "batam"}
 
 
 def country_from_pol(pol: str) -> str:
